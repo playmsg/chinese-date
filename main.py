@@ -34,8 +34,12 @@ class logStatus(QThread):
         self.logdict = {}
         logging.info(self.jobListFile+".proc")
         with open(self.jobListFile+".proc", 'r') as logFile:
+            jobStatus = QStandardItem("开始处理")
+            jobStatus.setTextAlignment(Qt.AlignCenter)
+            self.joblist.setItem(self.jobtableviewIndex, 1, jobStatus)
+
             while self.processStatus != "end":
-                time.sleep(1)
+                time.sleep(0.5)
                 loglist = logFile.readlines()
                 for logvalue in loglist:
                     logvalueN = logvalue.replace("\n", "")

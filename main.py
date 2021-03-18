@@ -3,12 +3,12 @@ import os
 import sys
 import time
 from queue import Queue
-from PySide6.QtCore import (QModelIndex, QObject, QProcess, QSize, Qt,
+from PySide6.QtCore import (QObject, QProcess, Qt,
                             QThread)
-from PySide6.QtGui import QIcon, QPixmap, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QStandardItem, QStandardItemModel
 # import subprocess
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QLabel,
-                               QMainWindow, QMessageBox, QTableWidget)
+                               QMainWindow, QMessageBox)
 
 from helpui import Ui_Dialog
 from mainui import Ui_MainWindow
@@ -139,7 +139,7 @@ class MainWindow(QMainWindow):
             "background-color:white;"
             "padding:4px;"
             "}")
-        aboutmeText = '''<a href="https://dvd3.net" style="color:gray">如果觉得有用给老哥点个赞>></a>'''
+        aboutmeText = '''<a href="https://dvd3.net/2021/03/cdffmpeg/" style="color:gray">如果觉得有用给老哥点个赞>></a>'''
         self.ui.aboutlink = QLabel(aboutmeText)
         self.ui.aboutlink.setOpenExternalLinks(True)
         self.ui.statusbar.setStyleSheet("QStatusBar::item{border: 0px}")
@@ -149,7 +149,7 @@ class MainWindow(QMainWindow):
 
     def joinFile(self):
         fileName_choose, filetype = QFileDialog.getOpenFileNames(
-            self, "文件保存", self.cwd, "视频文件 (*.mp4 *.avi *.mkv *.wmv)")
+            self, "文件保存", "", "视频文件 (*.mp4 *.avi *.mkv *.wmv)")
         if len(fileName_choose) > 0:
             self.ui.fileListWidget.addItems(fileName_choose)
             # logging.info(fileName_choose)

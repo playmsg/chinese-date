@@ -68,9 +68,14 @@ class watchjob(QObject):
         while True:
             time.sleep(2)
             jobStatus = self.joblist.item(self.joblist.rowCount()-1, 1).text()
+            # 判断最后一行第二列文字内容是否为“已解决”，如果都解决了就退出。不过这里的判断有个BUG，
+            # 就是如果在运行途中加入任务，那么新加入的任务不会被执行，永远都是未解决死循环
+            # 看了几个月前的代码后，根本忘了逻辑了，也懒得想，直接禁止中途加入任务了……
             logging.info("jobstatus:"+jobStatus)
             if jobStatus == "已解决":
                 self.ui.btnStartJob.setEnabled(True)
+                self.ui.btnJoinFile.setEnabled(True)
+                self.ui.btnSaveFile.setEnabled(True)
                 break
 
 
@@ -157,6 +162,8 @@ class MainWindow(QMainWindow):
     def startJob(self):
         fineNum = 0
         self.ui.btnStartJob.setEnabled(False)
+        self.ui.btnJoinFile.setEnabled(False)
+        self.ui.btnSaveFile.setEnabled(False)
         QApplication.processEvents()
         if self.joblist.rowCount() == 0:
             QMessageBox.warning(self, "你有压力", "得先添加任务才能开始任务")
@@ -243,21 +250,22 @@ class MainWindow(QMainWindow):
         self.ui.fileListWidget.setCurrentRow(newRow)
 
     def closeEvent(self, e):
-        res = QMessageBox.question(
-            self, "你有压力", "退出后未完成的任务列表将被清空，是否继续退出？", QMessageBox.Cancel | QMessageBox.Ok)
-        if res == QMessageBox.Ok:
-            fileList = os.scandir('.')
-            for sFile in fileList:
-                if sFile.is_file() and sFile.name.split(".")[-1].lower() == "job" and sFile.name.split(".")[0].lower().isdigit():
-                    logging.info(os.getcwd()+"\\"+sFile.name)
-                    jobfile = os.getcwd()+"\\"+sFile.name
-                    jobfilelog = os.getcwd()+"\\"+sFile.name+".proc"
-                    os.remove(jobfile)
-                    if os.path.exists(jobfilelog):
-                        os.remove(jobfilelog)
-            e.accept()
-        else:
-            e.ignore()
+        if self.joblist.rowCount() != 0:
+            res = QMessageBox.question(
+                self, "你有压力", "退出后未完成的任务列表将被清空，是否继续退出？", QMessageBox.Cancel | QMessageBox.Ok)
+            if res == QMessageBox.Ok:
+                fileList = os.scandir('.')
+                for sFile in fileList:
+                    if sFile.is_file() and sFile.name.split(".")[-1].lower() == "job" and sFile.name.split(".")[0].lower().isdigit():
+                        logging.info(os.getcwd()+"\\"+sFile.name)
+                        jobfile = os.getcwd()+"\\"+sFile.name
+                        jobfilelog = os.getcwd()+"\\"+sFile.name+".proc"
+                        os.remove(jobfile)
+                        if os.path.exists(jobfilelog):
+                            os.remove(jobfilelog)
+                e.accept()
+            else:
+                e.ignore()
 
 
 if __name__ == "__main__":

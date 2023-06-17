@@ -154,7 +154,7 @@ class MainWindow(QMainWindow):
 
     def joinFile(self):
         fileName_choose, filetype = QFileDialog.getOpenFileNames(
-            self, "文件保存", "", "视频文件 (*.mp4 *.avi *.mkv *.wmv)")
+            self, "文件保存", "", "视频文件 (*.mp4 *.avi *.mkv *.wmv *.flv)")
         if len(fileName_choose) > 0:
             self.ui.fileListWidget.addItems(fileName_choose)
             # logging.info(fileName_choose)

@@ -132,8 +132,8 @@ class MainWindow(QMainWindow):
         self.joblist.setHorizontalHeaderLabels(['任务', '速度/进度'])
         self.ui.tableView.setModel(self.joblist)
         self.header = self.ui.tableView.horizontalHeader()
-        self.header.setSectionResizeMode(0, self.header.Stretch)
-        self.header.setSectionResizeMode(1, self.header.Fixed)
+        self.header.setSectionResizeMode(0, self.header.ResizeMode.Stretch)
+        self.header.setSectionResizeMode(1, self.header.ResizeMode.Fixed)
         self.header.resizeSection(1, 100)
         self.header.setStyleSheet(
             "QHeaderView::section{"

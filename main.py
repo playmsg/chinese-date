@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import time
+import shutil
 from queue import Queue
 from PySide6.QtCore import (QObject, QProcess, Qt,
                             QThread)
@@ -100,14 +101,22 @@ class job(QObject):
             self.process = QProcess()
             self.process.setProgram("ffmpeg")
             # ffmpeg.exe -y -hwaccel cuda -f concat -safe 0 -i job1.txt -c copy 14.mp4 -progress job1out.txt
-            self.process.setArguments(['-y', '-f', 'concat', '-safe', '0', '-i',
-                                       jobListFile, '-c', 'copy', jobOutFile, '-progress', jobListFile+".proc", '-loglevel', 'quiet'])
+            self.process.setArguments(['-fflags', 'discardcorrupt','-err_detect', 'ignore_err','-y', '-f', 'concat', '-safe', '0', '-i',
+                                       jobListFile, '-c', 'copy', jobOutFile, '-progress', jobListFile+".proc"])
 
             # self.process.startDetached()
-            # logging.info(str(self.process.arguments()))
+            logging.info(str(self.process.arguments()))
             # self.process.finished.connect(self.res)
             self.process.start()
             time.sleep(1)
+            def print_output():
+                stdout = self.process.readAllStandardOutput().data().decode()
+                stderr = self.process.readAllStandardError().data().decode()
+                if stdout:
+                    logging.info(stdout)
+                if stderr:
+                    logging.info(stderr)
+            print_output()
             if os.path.exists(jobListFile):
                 self._logStatus = logStatus(
                     jobListFile, self.joblist, jobtableviewIndex)
@@ -115,7 +124,7 @@ class job(QObject):
                 self._logStatus.wait()
             self.process.waitForFinished(-1)
             logging.info(self.process.state())
-
+            print_output()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -132,8 +141,8 @@ class MainWindow(QMainWindow):
         self.joblist.setHorizontalHeaderLabels(['任务', '速度/进度'])
         self.ui.tableView.setModel(self.joblist)
         self.header = self.ui.tableView.horizontalHeader()
-        self.header.setSectionResizeMode(0, self.header.Stretch)
-        self.header.setSectionResizeMode(1, self.header.Fixed)
+        self.header.setSectionResizeMode(0, self.header.ResizeMode.Stretch)
+        self.header.setSectionResizeMode(1, self.header.ResizeMode.Fixed)
         self.header.resizeSection(1, 100)
         self.header.setStyleSheet(
             "QHeaderView::section{"
@@ -152,9 +161,16 @@ class MainWindow(QMainWindow):
         self.helpWindows = helpWindow()
         self.ui.btnAbout.clicked.connect(self.helpWindows.exec)
 
+        # check if ffmpeg exist in PATH
+        try:
+            assert shutil.which("ffmpeg") is not None
+        except AssertionError:
+            QMessageBox.critical(self, "你有压力", "ffmpeg.exe不存在或者没有加入环境变量")
+            sys.exit(1)
+
     def joinFile(self):
         fileName_choose, filetype = QFileDialog.getOpenFileNames(
-            self, "文件保存", "", "视频文件 (*.mp4 *.avi *.mkv *.wmv)")
+            self, "文件保存", None, "视频文件 (*.mp4 *.avi *.mkv *.wmv *.flv)")
         if len(fileName_choose) > 0:
             self.ui.fileListWidget.addItems(fileName_choose)
             # logging.info(fileName_choose)
@@ -205,9 +221,11 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
     def saveFile(self):
+        first_input_filename=self.ui.fileListWidget.item(0).text()
+        default_save_filename=os.path.splitext(os.path.basename(first_input_filename))[0]+"_合并视频"+os.path.splitext(os.path.basename(first_input_filename))[1]
         fileName_choose, filetype = QFileDialog.getSaveFileName(self,
                                                                 "文件保存",
-                                                                self.cwd,
+                                                                os.path.join(self.cwd,default_save_filename),
                                                                 "视频文件 (*.mp4 *.avi *.mkv *.wmv)")
 
         jobstat = QStandardItem("未解决")

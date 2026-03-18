@@ -1,2 +1,9 @@
 *.pyc
+__pycache__/
 *.job
+*.proc
+.venv/
+.uv-cache/
+build/
+dist/
+*.spec

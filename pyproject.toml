@@ -1,0 +1,21 @@
+[project]
+name = "chinese-date"
+version = "0.1.0"
+description = "Lossless segmented video merger based on ffmpeg"
+requires-python = ">=3.11"
+dependencies = [
+    "pyside6>=6.10.2",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.19.0",
+    "ruff>=0.15.6",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+"main_ui.py" = ["F401", "F403", "F405"]
+"help_ui.py" = ["F401", "F403", "F405"]

@@ -1,295 +1,357 @@
 import logging
 import os
-import sys
-import time
 import shutil
-from queue import Queue
-from PySide6.QtCore import (QObject, QProcess, Qt,
-                            QThread)
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QStandardItem, QStandardItemModel
-# import subprocess
-from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QLabel,
-                               QMainWindow, QMessageBox)
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+)
 
-from helpui import Ui_Dialog
-from mainui import Ui_MainWindow
-jobQ = Queue()
-logging.basicConfig(level=logging.NOTSET)
+from help_ui import Ui_Dialog
+from main_ui import Ui_MainWindow
+
+logging.basicConfig(level=logging.INFO)
+
+JOB_PENDING = "未解决"
+JOB_RUNNING = "开始处理"
+JOB_DONE = "已解决"
+JOB_FAILED = "失败"
+
+INPUT_FILTER = "视频文件 (*.mp4 *.avi *.mkv *.wmv *.flv)"
+OUTPUT_FILTER = "视频文件 (*.mp4 *.avi *.mkv *.wmv)"
+MP4_LIKE_SUFFIXES = {".mp4", ".m4v", ".mov"}
 
 
-class helpWindow(QDialog, Ui_Dialog):
+@dataclass(slots=True)
+class JobTask:
+    list_file: Path
+    output_file: Path
+    row_index: int
+
+
+def build_concat_line(file_path: str) -> str:
+    normalized_path = file_path.replace("\\", "/")
+    escaped_path = normalized_path.replace("'", r"'\''")
+    return f"file '{escaped_path}'\n"
+
+
+def build_ffmpeg_command(list_file: Path, output_file: Path) -> list[str]:
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+    ]
+    if output_file.suffix.lower() in MP4_LIKE_SUFFIXES:
+        command.extend(["-movflags", "+faststart"])
+    command.extend(["-progress", "pipe:1", "-nostats", str(output_file)])
+    return command
+
+
+class HelpWindow(QDialog, Ui_Dialog):
     def __init__(self):
-        super(helpWindow, self).__init__()
+        super().__init__()
         self.setupUi(self)
 
 
-class logStatus(QThread):
-    def __init__(self, jobListFile, joblist, jobtableviewIndex, parent=None):
-        super().__init__()
-        self.joblist = joblist
-        self.jobListFile = jobListFile
-        self.jobtableviewIndex = jobtableviewIndex
+class JobWorker(QThread):
+    status_changed = Signal(int, str)
+    job_error = Signal(int, str)
+    all_finished = Signal()
+
+    def __init__(self, tasks: list[JobTask], parent=None):
+        super().__init__(parent)
+        self.tasks = tasks
 
     def run(self):
-        self.processStatus = ""
-        self.logdict = {}
-        logging.info(self.jobListFile+".proc")
-        with open(self.jobListFile+".proc", 'r') as logFile:
-            jobStatus = QStandardItem("开始处理")
-            jobStatus.setTextAlignment(Qt.AlignCenter)
-            self.joblist.setItem(self.jobtableviewIndex, 1, jobStatus)
+        try:
+            for task in self.tasks:
+                if self.isInterruptionRequested():
+                    break
+                self._run_single_task(task)
+        finally:
+            self.all_finished.emit()
 
-            while self.processStatus != "end":
-                time.sleep(0.5)
-                loglist = logFile.readlines()
-                for logvalue in loglist:
-                    logvalueN = logvalue.replace("\n", "")
-                    key, value = logvalueN.split("=", maxsplit=1)
-                    self.logdict[key] = value
-                self.processSpeed = self.logdict['speed']
-                self.processStatus = self.logdict['progress']
-                jobSpeed = QStandardItem(self.processSpeed)
-                jobSpeed.setTextAlignment(Qt.AlignCenter)
-                self.joblist.setItem(self.jobtableviewIndex, 1, jobSpeed)
+    def _run_single_task(self, task: JobTask):
+        self.status_changed.emit(task.row_index, JOB_RUNNING)
+        command = build_ffmpeg_command(task.list_file, task.output_file)
+        logging.info("Running ffmpeg: %s", " ".join(command))
+        try:
+            with subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            ) as process:
+                if process.stdout is not None:
+                    for raw_line in process.stdout:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        if "=" not in line:
+                            logging.info(line)
+                            continue
+                        key, value = line.split("=", maxsplit=1)
+                        if key == "speed":
+                            self.status_changed.emit(task.row_index, value)
+                return_code = process.wait()
+            if return_code == 0:
+                self.status_changed.emit(task.row_index, JOB_DONE)
+                return
+            self.status_changed.emit(task.row_index, JOB_FAILED)
+            self.job_error.emit(
+                task.row_index,
+                f"{task.output_file.name} 合并失败，ffmpeg 退出码: {return_code}",
+            )
+        except Exception as exc:  # pragma: no cover - UI runtime path
+            logging.exception("Failed to run ffmpeg for task %s", task.output_file)
+            self.status_changed.emit(task.row_index, JOB_FAILED)
+            self.job_error.emit(task.row_index, f"{task.output_file.name} 合并异常: {exc}")
 
-            jobStatus = QStandardItem("已解决")
-            jobStatus.setTextAlignment(Qt.AlignCenter)
-            self.joblist.setItem(self.jobtableviewIndex, 1, jobStatus)
-            self.exit(0)
-        self.exit(1)
-
-
-class watchjob(QObject):
-    def __init__(self, joblist, ui):
-        super(watchjob, self).__init__()
-        self.joblist = joblist
-        self.ui = ui
-
-    def btn(self):
-        while True:
-            time.sleep(2)
-            jobStatus = self.joblist.item(self.joblist.rowCount()-1, 1).text()
-            # 判断最后一行第二列文字内容是否为“已解决”，如果都解决了就退出。不过这里的判断有个BUG，
-            # 就是如果在运行途中加入任务，那么新加入的任务不会被执行，永远都是未解决死循环
-            # 看了几个月前的代码后，根本忘了逻辑了，也懒得想，直接禁止中途加入任务了……
-            logging.info("jobstatus:"+jobStatus)
-            if jobStatus == "已解决":
-                self.ui.btnStartJob.setEnabled(True)
-                self.ui.btnJoinFile.setEnabled(True)
-                self.ui.btnSaveFile.setEnabled(True)
-                break
-
-
-class job(QObject):
-    def __init__(self, joblist):
-        super(job, self).__init__()
-        self.joblist = joblist
-
-    def res(self,  exitCode,  exitStatus):
-        logging.info("res code:")
-        logging.info(exitStatus)
-
-    def runJoinP(self):
-        while True:
-            if jobQ.empty():
-                break
-            jobQlist = jobQ.get()
-            jobQ.task_done()
-            jobListFile = jobQlist[0]
-            jobOutFile = jobQlist[1]
-            jobtableviewIndex = jobQlist[2]
-            self.process = QProcess()
-            self.process.setProgram("ffmpeg")
-            # ffmpeg.exe -y -hwaccel cuda -f concat -safe 0 -i job1.txt -c copy 14.mp4 -progress job1out.txt
-            self.process.setArguments(['-fflags', 'discardcorrupt','-err_detect', 'ignore_err','-y', '-f', 'concat', '-safe', '0', '-i',
-                                       jobListFile, '-c', 'copy', jobOutFile, '-progress', jobListFile+".proc"])
-
-            # self.process.startDetached()
-            logging.info(str(self.process.arguments()))
-            # self.process.finished.connect(self.res)
-            self.process.start()
-            time.sleep(1)
-            def print_output():
-                stdout = self.process.readAllStandardOutput().data().decode()
-                stderr = self.process.readAllStandardError().data().decode()
-                if stdout:
-                    logging.info(stdout)
-                if stderr:
-                    logging.info(stderr)
-            print_output()
-            if os.path.exists(jobListFile):
-                self._logStatus = logStatus(
-                    jobListFile, self.joblist, jobtableviewIndex)
-                self._logStatus.start()
-                self._logStatus.wait()
-            self.process.waitForFinished(-1)
-            logging.info(self.process.state())
-            print_output()
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super(MainWindow, self).__init__()
+        super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.cwd = os.getcwd()
-        self.ui.btnJoinFile.clicked.connect(self.joinFile)
-        self.ui.btnFileUp.clicked.connect(self.fileUp)
-        self.ui.btnFileDown.clicked.connect(self.fileDown)
-        self.ui.btnSaveFile.clicked.connect(self.saveFile)
-        self.ui.btnStartJob.clicked.connect(self.startJob)
+        self.worker: JobWorker | None = None
+        self.worker_errors: list[str] = []
+
+        self.ui.btnJoinFile.clicked.connect(self.join_file)
+        self.ui.btnFileUp.clicked.connect(self.file_up)
+        self.ui.btnFileDown.clicked.connect(self.file_down)
+        self.ui.btnSaveFile.clicked.connect(self.save_file)
+        self.ui.btnStartJob.clicked.connect(self.start_job)
+        self.ui.btnAbout.clicked.connect(self._open_help)
+
         self.joblist = QStandardItemModel()
-        self.joblist.setHorizontalHeaderLabels(['任务', '速度/进度'])
+        self.joblist.setHorizontalHeaderLabels(["任务", "速度/进度"])
         self.ui.tableView.setModel(self.joblist)
-        self.header = self.ui.tableView.horizontalHeader()
-        self.header.setSectionResizeMode(0, self.header.ResizeMode.Stretch)
-        self.header.setSectionResizeMode(1, self.header.ResizeMode.Fixed)
-        self.header.resizeSection(1, 100)
-        self.header.setStyleSheet(
+        self._setup_table_view()
+        self._setup_status_bar()
+        self.help_window = HelpWindow()
+
+        if shutil.which("ffmpeg") is None:
+            QMessageBox.critical(self, "你有压力", "ffmpeg.exe 不存在或者没有加入环境变量")
+            sys.exit(1)
+
+    def _setup_table_view(self):
+        header = self.ui.tableView.horizontalHeader()
+        header.setSectionResizeMode(0, header.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, header.ResizeMode.Fixed)
+        header.resizeSection(1, 100)
+        header.setStyleSheet(
             "QHeaderView::section{"
             "border-top:0px solid #D8D8D8;"
             "border-left:0px solid #D8D8D8;"
             "border-right:1px solid #D8D8D8;"
-            "border-bottom: 1px solid #D8D8D8;"
+            "border-bottom:1px solid #D8D8D8;"
             "background-color:white;"
             "padding:4px;"
-            "}")
-        aboutmeText = '''<a href="https://dvd3.net/2021/03/cdffmpeg/" style="color:gray">如果觉得有用给老哥点个赞>></a>'''
-        self.ui.aboutlink = QLabel(aboutmeText)
-        self.ui.aboutlink.setOpenExternalLinks(True)
+            "}"
+        )
+
+    def _setup_status_bar(self):
+        aboutme_text = (
+            '<a href="https://dvd3.net/2021/03/cdffmpeg/" style="color:gray">'
+            "如果觉得有用给老哥点个赞>></a>"
+        )
+        about_link = QLabel(aboutme_text)
+        about_link.setOpenExternalLinks(True)
         self.ui.statusbar.setStyleSheet("QStatusBar::item{border: 0px}")
-        self.ui.statusbar.addPermanentWidget(self.ui.aboutlink)
-        self.helpWindows = helpWindow()
-        self.ui.btnAbout.clicked.connect(self.helpWindows.exec)
+        self.ui.statusbar.addPermanentWidget(about_link)
 
-        # check if ffmpeg exist in PATH
-        try:
-            assert shutil.which("ffmpeg") is not None
-        except AssertionError:
-            QMessageBox.critical(self, "你有压力", "ffmpeg.exe不存在或者没有加入环境变量")
-            sys.exit(1)
+    def _open_help(self):
+        self.help_window.exec()
 
-    def joinFile(self):
-        fileName_choose, filetype = QFileDialog.getOpenFileNames(
-            self, "文件保存", None, "视频文件 (*.mp4 *.avi *.mkv *.wmv *.flv)")
-        if len(fileName_choose) > 0:
-            self.ui.fileListWidget.addItems(fileName_choose)
-            # logging.info(fileName_choose)
+    def _set_controls_enabled(self, enabled: bool):
+        self.ui.btnStartJob.setEnabled(enabled)
+        self.ui.btnJoinFile.setEnabled(enabled)
+        self.ui.btnSaveFile.setEnabled(enabled)
 
-    def startJob(self):
-        fineNum = 0
-        self.ui.btnStartJob.setEnabled(False)
-        self.ui.btnJoinFile.setEnabled(False)
-        self.ui.btnSaveFile.setEnabled(False)
-        QApplication.processEvents()
+    def _set_job_status(self, row_index: int, text: str):
+        item = QStandardItem(text)
+        item.setTextAlignment(Qt.AlignCenter)
+        self.joblist.setItem(row_index, 1, item)
+
+    def join_file(self):
+        selected_files, _ = QFileDialog.getOpenFileNames(self, "选择视频文件", None, INPUT_FILTER)
+        if selected_files:
+            self.ui.fileListWidget.addItems(selected_files)
+
+    def start_job(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "你有压力", "任务正在执行中，请先等待当前任务结束")
+            return
+
         if self.joblist.rowCount() == 0:
             QMessageBox.warning(self, "你有压力", "得先添加任务才能开始任务")
-            self.ui.btnStartJob.setEnabled(True)
-        else:
-            for i in range(self.joblist.rowCount()):
-                jobStatus = self.joblist.item(i, 1).text()
-                logging.info("join job:"+jobStatus)
-                if jobStatus == "未解决":
-                    jobListFile = str(i+1)+".job"
-                    jobOutFile = self.joblist.item(i, 0).text()
-                    jobtableviewIndex = i
-                    jobQlist = []
-                    jobQlist.append(jobListFile)
-                    jobQlist.append(jobOutFile)
-                    jobQlist.append(jobtableviewIndex)
-                    jobQ.put(jobQlist)
-                    fineNum = fineNum+1
-            if fineNum == 0:
-                QMessageBox.warning(self, "你有压力", "当前所有任务已经完成，再戳也不会开始了")
-                self.ui.btnStartJob.setEnabled(True)
-            else:
-                # 启动任务线程
-                self.tJob = job(self.joblist)
-                self.tJobThread = QThread()
-                self.tJob.moveToThread(self.tJobThread)
-                self.tJobThread.started.connect(self.tJob.runJoinP)
-                self.tJobThread.start()
-                self.tJobThread.exit(0)
-                # 启动任务状态监视线程，实现按钮可用性调整
-                self.watchJob = watchjob(self.joblist, self.ui)
-                self.watchJobT = QThread()
-                self.watchJob.moveToThread(self.watchJobT)
-                self.watchJobT.started.connect(self.watchJob.btn)
-                self.watchJobT.start()
-                self.watchJobT.exit(0)
+            return
 
-            # self.ui.btnStartJob.setEnabled(True)
-            QApplication.processEvents()
+        tasks: list[JobTask] = []
+        self.worker_errors = []
+        for row_index in range(self.joblist.rowCount()):
+            status_item = self.joblist.item(row_index, 1)
+            output_item = self.joblist.item(row_index, 0)
+            if status_item is None or output_item is None:
+                continue
+            if status_item.text() != JOB_PENDING:
+                continue
+            job_list_file = Path(f"{row_index + 1}.job")
+            if not job_list_file.exists():
+                self._set_job_status(row_index, JOB_FAILED)
+                self.worker_errors.append(f"{output_item.text()} 缺少任务文件: {job_list_file}")
+                continue
+            tasks.append(
+                JobTask(
+                    list_file=job_list_file,
+                    output_file=Path(output_item.text()),
+                    row_index=row_index,
+                )
+            )
 
-    def saveFile(self):
-        first_input_filename=self.ui.fileListWidget.item(0).text()
-        default_save_filename=os.path.splitext(os.path.basename(first_input_filename))[0]+"_合并视频"+os.path.splitext(os.path.basename(first_input_filename))[1]
-        fileName_choose, filetype = QFileDialog.getSaveFileName(self,
-                                                                "文件保存",
-                                                                os.path.join(self.cwd,default_save_filename),
-                                                                "视频文件 (*.mp4 *.avi *.mkv *.wmv)")
+        if not tasks:
+            message = "当前所有任务已经完成，再戳也不会开始了"
+            if self.worker_errors:
+                message = "当前没有可执行任务，且发现任务文件缺失，请重新添加任务"
+            QMessageBox.warning(self, "你有压力", message)
+            return
 
-        jobstat = QStandardItem("未解决")
-        jobstat.setTextAlignment(Qt.AlignCenter)
+        self._set_controls_enabled(False)
+        self.worker = JobWorker(tasks, self)
+        self.worker.status_changed.connect(self._set_job_status)
+        self.worker.job_error.connect(self._on_job_error)
+        self.worker.all_finished.connect(self._on_all_jobs_finished)
+        self.worker.start()
 
-        if fileName_choose != "":
-            jobfilename = QStandardItem(fileName_choose)
-            self.joblist.appendRow([jobfilename, jobstat])
+    def _on_job_error(self, row_index: int, message: str):
+        logging.error("Job %s failed: %s", row_index, message)
+        self.worker_errors.append(message)
 
-            jobtaskname = str(self.joblist.rowCount())+".job"
-            with open(jobtaskname, "w", encoding='utf-8') as jobfile:
-                jobfile.writelines("#begin\n")
-                listCount = self.ui.fileListWidget.count()
-                for i in range(listCount):
-                    mediaFile = "file "+"\'" + \
-                        self.ui.fileListWidget.item(i).text()+"\'"
-                    # logging.info(mediaFile)
-                    jobfile.write(mediaFile+"\r")
-            self.ui.fileListWidget.clear()
+    def _on_all_jobs_finished(self):
+        self._set_controls_enabled(True)
+        if self.worker_errors:
+            preview_count = min(len(self.worker_errors), 5)
+            details = "\n".join(self.worker_errors[:preview_count])
+            extra = ""
+            if len(self.worker_errors) > preview_count:
+                extra = f"\n... 还有 {len(self.worker_errors) - preview_count} 条错误"
+            QMessageBox.warning(self, "合并任务完成（含失败）", details + extra)
+        self.worker = None
 
-    def fileUp(self):
-        currentRow = self.ui.fileListWidget.currentRow()
-        currentItem = self.ui.fileListWidget.takeItem(currentRow)
-        if currentRow > 0:
-            newRow = currentRow-1
-        else:
-            newRow = currentRow
+    def save_file(self):
+        list_count = self.ui.fileListWidget.count()
+        if list_count == 0:
+            QMessageBox.warning(self, "你有压力", "请先加入至少一个视频文件")
+            return
 
-        self.ui.fileListWidget.insertItem(newRow, currentItem)
-        self.ui.fileListWidget.setCurrentRow(newRow)
+        first_input_filename = self.ui.fileListWidget.item(0).text()
+        base_name = os.path.splitext(os.path.basename(first_input_filename))[0]
+        ext_name = os.path.splitext(os.path.basename(first_input_filename))[1]
+        default_save_filename = f"{base_name}_合并视频{ext_name}"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "文件保存",
+            os.path.join(self.cwd, default_save_filename),
+            OUTPUT_FILTER,
+        )
+        if not save_path:
+            return
 
-    def fileDown(self):
-        currentRow = self.ui.fileListWidget.currentRow()
-        currentItem = self.ui.fileListWidget.takeItem(currentRow)
-        if currentRow < self.ui.fileListWidget.count():
-            newRow = currentRow+1
-        else:
-            newRow = currentRow
-        self.ui.fileListWidget.insertItem(newRow, currentItem)
-        self.ui.fileListWidget.setCurrentRow(newRow)
+        job_file_name = f"{self.joblist.rowCount() + 1}.job"
+        with open(job_file_name, "w", encoding="utf-8", newline="\n") as job_file:
+            job_file.write("# generated by chinese-date\n")
+            for index in range(list_count):
+                media_file = self.ui.fileListWidget.item(index).text()
+                job_file.write(build_concat_line(media_file))
 
-    def closeEvent(self, e):
-        if self.joblist.rowCount() != 0:
-            res = QMessageBox.question(
-                self, "你有压力", "退出后未完成的任务列表将被清空，是否继续退出？", QMessageBox.Cancel | QMessageBox.Ok)
-            if res == QMessageBox.Ok:
-                fileList = os.scandir('.')
-                for sFile in fileList:
-                    if sFile.is_file() and sFile.name.split(".")[-1].lower() == "job" and sFile.name.split(".")[0].lower().isdigit():
-                        logging.info(os.getcwd()+"\\"+sFile.name)
-                        jobfile = os.getcwd()+"\\"+sFile.name
-                        jobfilelog = os.getcwd()+"\\"+sFile.name+".proc"
-                        os.remove(jobfile)
-                        if os.path.exists(jobfilelog):
-                            os.remove(jobfilelog)
-                e.accept()
-            else:
-                e.ignore()
+        job_name_item = QStandardItem(save_path)
+        job_status_item = QStandardItem(JOB_PENDING)
+        job_status_item.setTextAlignment(Qt.AlignCenter)
+        self.joblist.appendRow([job_name_item, job_status_item])
+        self.ui.fileListWidget.clear()
+
+    def file_up(self):
+        current_row = self.ui.fileListWidget.currentRow()
+        if current_row <= 0:
+            return
+        current_item = self.ui.fileListWidget.takeItem(current_row)
+        if current_item is None:
+            return
+        new_row = current_row - 1
+        self.ui.fileListWidget.insertItem(new_row, current_item)
+        self.ui.fileListWidget.setCurrentRow(new_row)
+
+    def file_down(self):
+        current_row = self.ui.fileListWidget.currentRow()
+        last_row = self.ui.fileListWidget.count() - 1
+        if current_row < 0 or current_row >= last_row:
+            return
+        current_item = self.ui.fileListWidget.takeItem(current_row)
+        if current_item is None:
+            return
+        new_row = current_row + 1
+        self.ui.fileListWidget.insertItem(new_row, current_item)
+        self.ui.fileListWidget.setCurrentRow(new_row)
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "你有压力", "当前任务还在执行，请等待合并完成后再退出")
+            event.ignore()
+            return
+
+        if self.joblist.rowCount() == 0:
+            event.accept()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "你有压力",
+            "退出后未完成的任务列表将被清空，是否继续退出？",
+            QMessageBox.Cancel | QMessageBox.Ok,
+        )
+        if reply != QMessageBox.Ok:
+            event.ignore()
+            return
+
+        for pending_job_file in Path(".").glob("*.job"):
+            if pending_job_file.stem.isdigit():
+                pending_job_file.unlink(missing_ok=True)
+        for pending_log_file in Path(".").glob("*.job.proc"):
+            if pending_log_file.name.split(".")[0].isdigit():
+                pending_log_file.unlink(missing_ok=True)
+        event.accept()
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-
-    window = MainWindow()
-
-    window.show()
-    sys.exit(app.exec_())
+    sys.exit(main())
